@@ -18,3 +18,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["basketpilot"]
+
+[tool.pytest.ini_options]
+# The offline suite must run in seconds with no network, no API key and no browser.
+# Live-browser tests are marked and excluded by default:
+#     pytest -m "not browser"     # offline, the default expectation
+#     pytest -m browser           # real runs against real retailers, costs credit
+addopts = "-m 'not browser'"
+markers = [
+    "browser: real-browser integration test; needs an API key, network and credit",
+]

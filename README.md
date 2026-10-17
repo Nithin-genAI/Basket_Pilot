@@ -8,6 +8,116 @@ Phase 1 proves one real browser integration against one real retailer (Blinkit).
 deliberately not a product — there is no frontend, no database, no ordering, and no
 second retailer adapter.
 
+---
+
+# Phase 2 + 3: parent agent, TinyFish Browser, basket optimization
+
+Phase 2 takes a whole shopping list, searches real retailers, and works out the best
+*practical* way to buy it. Everything below is additive — the Phase 1 command is
+unchanged and still returns its 60 products.
+
+## The exact command
+
+```bash
+python -m basketpilot compare \
+  --list "2L Amul milk, a dozen eggs, brown bread" \
+  --pincode 560001 --retailer blinkit --engine tinyfish_browser
+```
+
+Real output from `runs/compare_e2e4.log`:
+
+```
+── retailers ──
+  OK    Blinkit             35 products via tinyfish_browser
+
+── recommendation ──
+  blinkit  ·  ₹188  ·  1 platform(s)  ·  2/3 items  ·  estimated
+    [Blinkit] Nutri Hatch White Eggs · 12 pcs — ₹107
+    [Blinkit] The Health Factory Zero Maida Whole Wheat Bread · 250 g — ₹55
+    [??] Amul Lactose Free Milk · 250 ml — ₹26
+         not counted as covered: only a different size is available: pack is 250 ml
+         but the request was 2000ml. Approval needed before this is bought.
+    · covers 2/3 items; 1 held for approval (only a different size available): milk
+    · total is an estimate: blinkit: delivery fee not verified; ...
+
+No order was placed and no payment was made — this is a recommendation only.
+```
+
+Note the `[??]` line. The list asked for **2 L** of Amul milk; Blinkit returned a 250 ml
+carton. That is a real product at a real price, and it is *not* what was asked for — so
+it is shown, priced, and held for approval, and it does not count toward coverage. An
+earlier version of this pipeline silently bought it.
+
+## What Phase 2 found, by testing rather than assuming
+
+| Finding | Evidence |
+|---|---|
+| **TinyFish's Browser API reaches Blinkit; the Agent API does not.** | `POST api.browser.tinyfish.ai` → 201 with a `cdp_url`; the Agent API is Cloudflare-blocked. |
+| **The two TinyFish surfaces disagree about country codes.** | `proxy_config.country_code: "IN"` is accepted by the Browser API and rejected with HTTP 400 by the Agent API. The docs' "any ISO 3166-1 alpha-2" claim holds for one and not the other. |
+| **The proxy is a genuine Indian residential IP.** | Egress reported Mumbai, Maharashtra, AS55836 Reliance Jio Infocomm. |
+| **The Fetch API is useless for products here.** | It returns SPA shells — BigBasket navigation chrome, Blinkit footer text. Free triage, no catalogue. |
+| **Blinkit challenges the *search* navigation, not the landing page.** | The landing page returns its real title; the first search of a run intermittently returns no XHR at all. |
+| **A warmed Browser Context Profile is available and the API is enabled.** | `GET /v1/profiles` returns a profile; `domain_count: 0` means none has been warmed yet. |
+
+### Two bugs the run log found, and what they actually were
+
+Both were diagnosed from a real log, not from reasoning:
+
+1. **A false-positive challenge detector.** The detector treated the string
+   `challenge-platform` in the page HTML as evidence of a block. That string is
+   Cloudflare's Turnstile *script tag*, which Blinkit serves on healthy pages too. The
+   log proved it: the marker was reported present, the very next search on the same page
+   returned 12 products, and the marker never cleared. It was burning 45 s per query
+   waiting for a challenge that did not exist.
+
+2. **A client-side route that never fired the search XHR.** Blinkit's search is a
+   client-side route, so navigating to a search URL the SPA already believes it is on
+   does not re-issue the request — the run then waits 35 s for a request that was never
+   made. That is why the *first* query of a run came back empty while later ones
+   succeeded. Retries now re-warm on the retailer's home page first, which makes the next
+   search a real route change. After this fix, all three queries returned products
+   (milk 11, eggs 12, bread 12) with no challenge waits at all.
+
+## The warmed profile — one manual step
+
+A cold browser clears Blinkit's challenge only sometimes. A profile that has already
+passed it starts from a state that does not need to. The setup is three documented calls
+and **one human step in a browser** — this tool never sees, asks for, or logs a password:
+
+```bash
+python tools/setup_profile.py create --name blinkit-560001     # done: prof_49f953ae3ed84aba
+python tools/setup_profile.py connect --profile-id prof_49f953ae3ed84aba
+#   → prints a cdp_url and opens a browser on the TinyFish session.
+#     Log in to Blinkit there and set the delivery pincode to 560001.
+python tools/setup_profile.py save --profile-id prof_49f953ae3ed84aba --session-id <sid>
+```
+
+Then reuse it:
+
+```bash
+python -m basketpilot compare --list "..." --pincode 560001 \
+  --retailer blinkit --engine tinyfish_browser --profile-id prof_49f953ae3ed84aba
+```
+
+The run log records whether a profile was used, so a warm result can never be read as
+cold or the reverse. Without `--profile-id` the pipeline runs cold, which is the default.
+
+## Tests
+
+```bash
+pytest -m "not browser"    # 79 tests, ~0.2s, no network, no key, no browser
+pytest -m browser          # real runs against real retailers; costs credit
+```
+
+The offline suite is the default. Live tests are marked and excluded by
+`addopts = "-m 'not browser'"` in `pyproject.toml`, so they cannot run by accident.
+
+## The safety boundary
+
+No order is submitted, no payment is made, no item is added to a cart. The workflow ends
+at a ranked recommendation and the evidence behind it. It is built so a later phase can
+insert an explicit approval gate before any purchase action.
+
 ## The exact command
 
 ```bash

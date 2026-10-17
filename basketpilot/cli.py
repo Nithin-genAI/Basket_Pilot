@@ -181,7 +181,87 @@ def report(result: RetailerResult, *, log_path: Path, quiet: bool) -> None:
                 print(f"       ! {warning}", file=stream)
 
 
+def build_compare_parser() -> argparse.ArgumentParser:
+    """The Phase 2 subcommand parser.
+
+    Kept entirely separate from :func:`build_parser` so that the Phase 1 command line
+    — its arguments, its defaults and its exit codes — is not touched by Phase 2.
+    """
+    parser = argparse.ArgumentParser(
+        prog="basketpilot compare",
+        description=(
+            "Take a whole shopping list, search real retailers, and recommend the best "
+            "practical way to buy it — preferring one platform, splitting only when it "
+            "genuinely helps."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            '  python -m basketpilot compare --list "2L Amul milk, a dozen eggs, brown bread"\n'
+            '  python -m basketpilot compare --list "milk, bread" --retailer blinkit --engine cloak\n'
+            "  python -m basketpilot compare --retailers      # show what is verified\n"
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        dest="raw_list",
+        default=None,
+        help="The shopping list, e.g. \"2 litres of Amul milk, a dozen eggs, brown bread\".",
+    )
+    parser.add_argument("--pincode", default="560001", help="Delivery pincode.")
+    parser.add_argument(
+        "--engine",
+        choices=("auto", "tinyfish_browser", "tinyfish_agent", "cloak"),
+        default="auto",
+        help="Execution layer. auto = TinyFish Browser first, local browser on failure.",
+    )
+    parser.add_argument(
+        "--retailer",
+        action="append",
+        dest="retailers",
+        help="Search only this retailer (repeatable). Default: all, verified first.",
+    )
+    parser.add_argument(
+        "--max-platforms", type=int, default=3,
+        help="Most retailers a recommended basket may use (default 3).",
+    )
+    parser.add_argument("--budget", type=float, default=None, help="Budget cap in rupees.")
+    parser.add_argument(
+        "--split-penalty", type=float, default=25.0,
+        help="Rupees added per extra platform, to prefer simple baskets (default 25).",
+    )
+    parser.add_argument(
+        "--proxy-country", default="IN",
+        help="TinyFish Browser proxy exit country (default IN). 'none' disables it.",
+    )
+    parser.add_argument(
+        "--profile-id", default=None,
+        help=(
+            "Reuse a warmed TinyFish Browser Context Profile (see tools/setup_profile.py). "
+            "Omit to run cold."
+        ),
+    )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Print which retailers are verified and exit.",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress logging.")
+    parser.add_argument(
+        "--json-only", action="store_true",
+        help="Print only the JSON result, with no surrounding narrative.",
+    )
+    parser.add_argument("--output", type=Path, default=None, help="Write JSON here.")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Phase 2 dispatch happens before the Phase 1 parser is built, so adding the
+    # subcommand cannot change how the original command line behaves.
+    if argv and argv[0] == "compare":
+        return _compare_main(argv[1:])
+
     args = build_parser().parse_args(argv)
 
     queries = parse_queries(args.queries)
@@ -276,6 +356,56 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     return EXIT_RUN_FAILED
+
+
+def _compare_main(argv: list[str]) -> int:
+    """Entry point for `basketpilot compare`."""
+    from .compare import CompareOptions, main as compare_main, retailer_report
+
+    args = build_compare_parser().parse_args(argv)
+
+    if args.status:
+        # The "which retailers actually work" answer, straight from the ledger.
+        print(json.dumps(retailer_report(), indent=2, default=str))
+        return EXIT_OK
+
+    if not args.raw_list:
+        print("error: --list is required (or pass --status to see verification status)", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    try:
+        settings: Settings = load_settings()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    # The TinyFish engines need a key; the local browser does not. Checked here so the
+    # failure is a clear message rather than a stack trace from deep in a run.
+    if args.engine in ("auto", "tinyfish_browser", "tinyfish_agent") and not settings.has_tinyfish_key:
+        print(
+            "error: TINYFISH_API_KEY is not set, so the TinyFish engines cannot run. "
+            "Add it to .env, or pass --engine cloak to use the local browser.",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIG_ERROR
+
+    country = None if args.proxy_country.lower() in ("none", "", "off") else args.proxy_country
+
+    options = CompareOptions(
+        raw_list=args.raw_list,
+        pincode=args.pincode,
+        engine=args.engine,
+        retailers=args.retailers,
+        max_platforms=args.max_platforms,
+        budget=args.budget,
+        split_penalty=args.split_penalty,
+        country=country,
+        profile_id=args.profile_id,
+        verbose=not args.quiet,
+        json_only=args.json_only,
+        output=args.output,
+    )
+    return compare_main(options, settings)
 
 
 if __name__ == "__main__":

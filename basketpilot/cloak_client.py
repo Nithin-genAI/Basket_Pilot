@@ -109,7 +109,16 @@ def detect_challenge(page: Any, response: Any = None) -> str | None:
         if "__cf_chl_" in url or "/cdn-cgi/challenge-platform" in url:
             return f"Cloudflare challenge interstitial at {url}"
         html = page.content() or ""
-        for marker in ("challenge-platform", "cf-chl-", "Just a moment...", "Attention Required"):
+        # NOT "challenge-platform". That string is Cloudflare's Turnstile *script tag*,
+        # which Blinkit serves on every page including perfectly healthy ones. It was in
+        # this list until a run proved it wrong: the marker was reported present, the
+        # very next search on the same page returned 12 products, and the marker never
+        # went away. A detector that fires on a working page is worse than no detector —
+        # it burned 45s per query waiting for a challenge that did not exist.
+        #
+        # What remains are markers of an actual interstitial: `cf-chl-` ids only appear
+        # in the challenge document, and the two titles are the interstitial's own.
+        for marker in ("cf-chl-", "Just a moment...", "Attention Required"):
             if marker in html:
                 return f"challenge marker {marker!r} present in the page"
     except Exception:  # noqa: BLE001 - detection must never break the run
@@ -895,146 +904,26 @@ def search(
         else:
             page = browser.new_page()
 
-        recorder = _NetworkRecorder()
-        recorder.attach(_recorder_emitter(page, log))
+        # The drive loop itself lives in retailer_runner: it is page-level work and
+        # is shared verbatim with the TinyFish Browser engine, which reaches the same
+        # page over CDP. Imported here rather than at module scope to keep the module
+        # graph acyclic — retailer_runner imports this module's extraction ladder.
+        from .retailer_runner import drive_page, save_state
 
-        log(f"navigating to {retailer_url}")
-        response = page.goto(retailer_url, wait_until="domcontentloaded", timeout=60_000)
-        time.sleep(4.0)  # let any bot challenge resolve
-
-        challenge = detect_challenge(page, response)
-        if challenge:
-            # A managed challenge often clears itself in a real browser given a moment,
-            # so give it one honest chance before calling it a block.
-            log(f"possible challenge detected ({challenge}); waiting for it to clear")
-            time.sleep(8.0)
-            challenge = detect_challenge(page)
-            if challenge:
-                result.raw["landed_url"] = page.url
-                result.raw["page_title"] = _safe_title(page)
-                _screenshot(page, screenshot_dir, retailer, result, log)
-                raise Blocked(challenge)
-            log("challenge cleared on its own")
-
-        result.raw["landed_url"] = page.url
-        result.raw["page_title"] = _safe_title(page)
-        log(f"landed on {page.url!r} title={result.raw['page_title']!r}")
-
-        location_ok = _set_delivery_location(page, pincode, log)
-        if not _catalogue_is_visible(page):
-            # Not fatal on its own — a search may still work — but it is the single
-            # most likely reason for an empty result, so say so now rather than
-            # letting it surface as a vague "no products extracted" later.
-            result.warnings.append(
-                f"the catalogue did not look available after setting location {pincode} "
-                f"(location step reported {'ok' if location_ok else 'failed'}); "
-                "search results may be empty or geo-restricted"
-            )
-            log("warning: catalogue not visibly available after the location step")
-
-        # What the landing page and the location step fetched. The location payloads are
-        # the most useful thing here: when the location step fails, they are the
-        # difference between "the site does not serve this pincode" and "the agent could
-        # not find the box".
-        log(f"{len(recorder.responses)} JSON response(s) captured from the landing and location steps")
-
-        all_products: list[Product] = []
-        for query in queries:
-            # The JSON rung gets two chances before the DOM rung is used at all. The
-            # order matters: the search XHR's body is occasionally lost to a race when
-            # Blinkit's SPA navigates again immediately after the response, and a single
-            # unlucky attempt is not evidence that the API is unavailable. A fresh
-            # search almost always captures cleanly — and the JSON rung is the only rung
-            # that yields product ids, and therefore product URLs. Falling back to the
-            # grid after one failed capture would silently halve URL coverage.
-            products: list[Product] = []
-            for attempt in (1, 2):
-                fresh = _search_and_collect(page, recorder, query, log)
-                log(f"{query!r}: {len(fresh)} JSON response(s) captured during this search")
-
-                products = _extract_from_network(fresh, query)
-                if products:
-                    log(f"{query!r}: {len(products)} product(s) from captured JSON")
-                    break
-
-                if attempt == 1:
-                    log(f"{query!r}: no JSON products — re-running the search once for a clean capture")
-                    time.sleep(3.0)
-
-            if not products:
-                # Both JSON attempts came up empty, so read the rendered grid instead.
-                # These rows have no product URL — the search page exposes no product
-                # ids — but a row with a real price is worth more than no row.
-                log(f"{query!r}: JSON rung empty twice, falling back to DOM text extraction")
-                products = _extract_from_dom(page, query)
-                if products:
-                    log(f"{query!r}: {len(products)} product(s) from DOM (no product URLs)")
-
-            if not products:
-                # Record what the page actually looked like, so a genuine empty result
-                # can be told apart from a page that failed to render.
-                log(f"{query!r}: nothing extracted after two search attempts")
-                result.warnings.append(f"{query!r}: no products after two search attempts")
-                shot_path = _screenshot_named(
-                    page, screenshot_dir, f"{retailer}-{query}-empty", log
-                )
-                if shot_path:
-                    result.raw.setdefault("empty_query_screenshots", []).append(str(shot_path))
-
-            all_products.extend(products)
-
-        result.products = all_products
-        result.raw["captured_json_urls"] = [e["url"] for e in recorder.responses][:60]
-
-        if screenshot_dir is not None:
-            try:
-                screenshot_dir.mkdir(parents=True, exist_ok=True)
-                shot = screenshot_dir / f"{retailer}-cloak-final.png"
-                page.screenshot(path=str(shot), full_page=False)
-                result.raw["screenshot"] = str(shot)
-                log(f"screenshot written to {shot}")
-            except Exception as exc:  # noqa: BLE001
-                log(f"screenshot failed: {exc}")
-
-        if not location_ok:
-            # Blinkit never confirmed the requested delivery location, so whatever the
-            # search returned is the catalogue for some *other* location. The rows are
-            # real — real names, real prices — but they are not an answer to the question
-            # that was asked, and there is no way for a consumer to tell that from the
-            # data alone. Reporting this as success would be the silent substitution the
-            # brief forbids, so it is a failure with the rows kept for inspection.
-            # Engine A already treats this case the same way (LOCATION_NOT_SET); the two
-            # engines agreeing matters more than either one being lenient.
-            result.status = "FAILED"
-            result.error_code = "LOCATION_NOT_SET"
-            result.error_message = (
-                f"Blinkit never confirmed a delivery location for pincode {pincode}, so "
-                f"the {len(all_products)} product(s) below are for an unknown location. "
-                "They are kept for inspection but are not a valid answer for this pincode."
-            )
-            for product in result.products:
-                product.warnings.append(
-                    f"location unverified: delivery to {pincode} was never confirmed"
-                )
-        elif all_products:
-            result.status = "COMPLETED"
-        else:
-            result.status = "FAILED"
-            result.error_code = "NO_PRODUCTS_EXTRACTED"
-            result.error_message = (
-                "The browser ran but no products could be extracted. Check the run log: "
-                "the location gate may not have been cleared, or the site's markup may "
-                "not match the extraction heuristics. The captured JSON URLs in the log "
-                "show what the page actually requested."
-            )
+        drive_page(
+            page,
+            result=result,
+            retailer_url=retailer_url,
+            pincode=pincode,
+            queries=queries,
+            engine="cloak",
+            screenshot_dir=screenshot_dir,
+            context=context,
+            log=log,
+        )
 
         if save_storage_state:
-            try:
-                Path(save_storage_state).parent.mkdir(parents=True, exist_ok=True)
-                (context or page.context).storage_state(path=str(save_storage_state))
-                log(f"saved session state to {save_storage_state}")
-            except Exception as exc:  # noqa: BLE001
-                log(f"could not save session state: {exc}")
+            save_state(page, context, Path(save_storage_state), log)
 
     except Blocked as exc:
         result.status = "FAILED"
