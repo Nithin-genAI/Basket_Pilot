@@ -359,18 +359,32 @@ def _product_from_record(record: dict[str, Any], query: str) -> Product | None:
     return product if product.is_valid else None
 
 
+from urllib.parse import quote, quote_plus, unquote
+
+
 def _url_names_query(url: str, query: str) -> bool:
     """True if a search URL is for this specific query.
 
-    Blinkit's search endpoint carries the query in the URL — either as `q=<query>` on
-    the first page or `actual_query=<query>` on pagination. Checking this is what makes
-    attribution trustworthy: responses arrive asynchronously and a slow one from the
-    previous query can land while the next query is running, so slicing captures by
-    arrival index is not enough to keep them apart.
+    Blinkit's search endpoint carries the query in the URL — either as `q=<query>`
+    or `actual_query=<query>`. We check unquoted text, %20 and + forms so encoding
+    mismatches never falsely reject valid search responses.
     """
-    token = quote(query.strip().lower())
-    lowered = url.lower()
-    return f"q={token}" in lowered or f"actual_query={token}" in lowered
+    lowered_url = url.lower()
+    unquoted = unquote(lowered_url)
+    q_clean = query.strip().lower()
+    tokens = [
+        q_clean,
+        quote(q_clean),
+        quote_plus(q_clean),
+        q_clean.replace(" ", "+"),
+        q_clean.replace(" ", "%20"),
+    ]
+    for token in tokens:
+        if f"q={token}" in lowered_url or f"actual_query={token}" in lowered_url:
+            return True
+        if f"q={token}" in unquoted or f"query={token}" in unquoted or f"actual_query={token}" in unquoted:
+            return True
+    return False
 
 
 def _extract_from_network(entries: list[dict[str, Any]], query: str) -> list[Product]:
@@ -406,12 +420,6 @@ def _extract_from_network(entries: list[dict[str, Any]], query: str) -> list[Pro
         return products
 
     # Nothing matched the known shape — fall back to the generic walk.
-    #
-    # The same attribution rule applies here, and it matters more: this path scans by
-    # content, so another query's response is exactly what it would otherwise latch
-    # onto. A search response that names a different query is skipped outright rather
-    # than mined for products. Responses from unrelated endpoints are still allowed,
-    # since those carry no query to check against.
     for entry in _rank_by_product_likeness(entries, query):
         url = entry.get("url", "")
         if SEARCH_ENDPOINT_MARKER in url and not _url_names_query(url, query):
@@ -442,68 +450,61 @@ def _rank_by_product_likeness(
 
 
 def _search_and_collect(
-    page: Any, recorder: _NetworkRecorder, query: str, log: Any
+    page: Any, recorder: _NetworkRecorder, query: str, log: Any, search_url: str | None = None
 ) -> list[dict[str, Any]]:
     """Search for one query and return the JSON captured during that search.
 
-    Waiting is done with Playwright's own ``expect_response`` rather than a polling
-    loop around ``time.sleep``. This is not a style choice — it is the difference
-    between working and not working.
-
-    In the sync API, response events are dispatched only while the main thread is
-    *inside* a Playwright call. A loop that checks a list and calls ``time.sleep``
-    never enters one, so queued response events are never dispatched and every
-    capture appears to be missing. ``expect_response`` both pumps the event loop and
-    waits for exactly the response we want.
+    Waiting is done with Playwright's expect_response with an 5s timeout on Blinkit.
+    Non-Blinkit retailers navigate to their own search URL directly.
     """
-    url = SEARCH_URL_TEMPLATE.format(query=quote(query))
+    url = search_url or SEARCH_URL_TEMPLATE.format(query=quote(query))
     mark = len(recorder.responses)
+    responded = False
+    is_blinkit = "blinkit" in url.lower()
 
-    try:
-        with page.expect_response(
-            lambda response: SEARCH_ENDPOINT_MARKER in response.url, timeout=35_000
-        ) as info:
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-            # Read the body HERE, inside the block and before anything else. Blinkit's
-            # SPA navigates again moments after the search XHR, and a body that is not
-            # read before that navigation is gone for good:
-            #   "Response body is not available for a response that was navigated away
-            #    from. Read response.body() before triggering any navigation."
-            response = info.value
-            try:
-                body = response.json()
-            except Exception as exc:  # noqa: BLE001
-                log(f"{query!r}: search body unreadable: {type(exc).__name__}: {exc}")
-                body = None
-        log(f"searched {query!r} — search API responded ({response.status})")
-        # The recorder usually captured this same response a moment earlier, from the
-        # context's emit, which precedes the page's. Only add it here when the recorder
-        # did not get it — otherwise every search payload is recorded twice, which
-        # double-counts the capture log and hands extraction the same body twice.
-        already = any(
-            entry["url"] == response.url and entry["status"] == response.status
-            for entry in recorder.responses[mark:]
-        )
-        if body is not None and not already:
-            log(f"{query!r}: the recorder missed this response; keeping the copy read here")
-            recorder.responses.append(
-                {
-                    "url": response.url,
-                    "status": response.status,
-                    "content_type": "application/json",
-                    "body": body,
-                    "request": {"url": response.url, "method": "POST", "headers": {},
-                                "post_data": None},
-                }
+    if is_blinkit:
+        try:
+            with page.expect_response(
+                lambda response: SEARCH_ENDPOINT_MARKER in response.url, timeout=5_000
+            ) as info:
+                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                response = info.value
+                responded = True
+                try:
+                    body = response.json()
+                except Exception as exc:  # noqa: BLE001
+                    body = None
+            log(f"searched {query!r} — search API responded ({response.status})")
+            already = any(
+                entry["url"] == response.url and entry["status"] == response.status
+                for entry in recorder.responses[mark:]
             )
-    except Exception as exc:  # noqa: BLE001
-        log(f"{query!r}: no search API response observed ({type(exc).__name__})")
-        for reason in recorder.skipped[-6:]:
-            log(f"    not captured: {reason}")
+            if body is not None and not already:
+                recorder.responses.append(
+                    {
+                        "url": response.url,
+                        "status": response.status,
+                        "content_type": "application/json",
+                        "body": body,
+                        "request": {"url": response.url, "method": "POST", "headers": {}, "post_data": None},
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            log(f"{query!r}: search response: {type(exc).__name__}")
+    else:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            time.sleep(1.0)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{query!r}: navigation error: {exc}")
 
-    # Let the grid render, which the DOM fallback needs.
-    time.sleep(8.0)
-    log(f"{query!r}: landed on {page.url}")
+    # Fast return: if response arrived, no need to sleep 8 seconds!
+    if responded or len(recorder.responses) > mark:
+        time.sleep(0.3)
+    else:
+        # Give DOM 1.5s to render if network search didn't capture JSON
+        time.sleep(1.5)
+
     return recorder.responses[mark:]
 
 

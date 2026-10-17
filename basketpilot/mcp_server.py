@@ -75,12 +75,14 @@ def _format_basket_summary(run_dict: dict[str, Any], exit_code: int) -> str:
             price = f"₹{offer.get('price'):.2f}" if offer.get("price") is not None else "N/A"
             retailer = offer.get("retailer", "unknown")
             engine = offer.get("engine", "unknown")
+            prod_url = prod.get("product_url")
+            link_str = f" [🔗 View Product]({prod_url})" if prod_url else ""
 
             if status == "needs_approval":
-                lines.append(f"- ⚠️ **[NEEDS APPROVAL]** {item_name} → {prod_name}{pkg} — {price} at {retailer} `[Engine: {engine}]`")
+                lines.append(f"- ⚠️ **[NEEDS APPROVAL]** {item_name} → {prod_name}{pkg} — {price} at {retailer}{link_str} `[Engine: {engine}]`")
                 lines.append(f"  *Reason*: {reason}")
             else:
-                lines.append(f"- ✅ **{item_name}**: {prod_name}{pkg} — {price} at {retailer} `[Engine: {engine}]`")
+                lines.append(f"- ✅ **{item_name}**: {prod_name}{pkg} — {price} at {retailer}{link_str} `[Engine: {engine}]`")
         else:
             lines.append(f"- ❌ **{item_name}**: Unavailable ({reason})")
 
@@ -100,14 +102,18 @@ def _format_basket_summary(run_dict: dict[str, Any], exit_code: int) -> str:
         lines.append(f"- **{ret_key}**: `{status_text}` ({prod_count} products via `{engine_used}`)")
 
     lines.append("")
-    lines.append("> **Note**: No order was placed and no payment was made. This is an audited price and basket recommendation only.")
+    lines.append("#### 🛒 1-Click Order / Cart:")
+    lines.append("- Review and checkout your items: [🛒 Open Blinkit Cart](https://blinkit.com/cart)")
+    lines.append("- To add items to your cart, tell me: *'Add recommended items to cart'*")
+    lines.append("")
+    lines.append("> **Note**: No order was placed and no payment was made. User authorizes checkout directly on the retailer site.")
     return "\n".join(lines)
 
 
 @mcp.tool(
     name="compare_grocery_basket",
     description=(
-        "Search Indian quick-commerce retailers (e.g. Blinkit) for a shopping list, "
+        "Search Indian quick-commerce retailers (e.g. Blinkit, Zepto) for a shopping list, "
         "retrieve real-time product prices and availability via browser automation, "
         "and calculate the optimal grocery basket. Preserves execution provenance (TinyFish vs fallback)."
     ),
@@ -155,6 +161,79 @@ def compare_grocery_basket(
         "items": run_dict.get("items", []),
         "retailers": run_dict.get("retailers", {}),
         "notes": run_dict.get("notes", []),
+    }
+
+
+@mcp.tool(
+    name="add_items_to_cart",
+    description=(
+        "Add grocery items to cart on the retailer site (e.g. Blinkit) and return the "
+        "direct checkout cart link. Never authorizes payment or places an order automatically."
+    ),
+)
+def add_items_to_cart(
+    product_urls: list[str],
+    retailer: str = "blinkit",
+    pincode: str = "560001",
+) -> dict[str, Any]:
+    """Automate adding verified product items to the retailer cart."""
+    added: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            state_file = Path.cwd() / ".blinkit_storage_state.json"
+            browser = p.chromium.launch(headless=True)
+            context_kwargs = {}
+            if state_file.exists():
+                context_kwargs["storage_state"] = str(state_file)
+            context = browser.new_context(**context_kwargs)
+
+            for url in product_urls:
+                if not url or not url.startswith("http"):
+                    continue
+                try:
+                    page = context.new_page()
+                    page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+                    page.wait_for_timeout(1500)
+                    add_btn = page.locator("button:has-text('ADD'), div:has-text('ADD')").first
+                    if add_btn.is_visible(timeout=4000):
+                        add_btn.click()
+                        page.wait_for_timeout(1000)
+                        added.append(url)
+                    else:
+                        failed.append({"url": url, "reason": "ADD button not found or out of stock"})
+                    page.close()
+                except Exception as exc:
+                    failed.append({"url": url, "reason": str(exc)})
+
+            # Update saved storage state with active cart cookies
+            try:
+                new_state = context.storage_state()
+                state_file.write_text(json.dumps(new_state, indent=2))
+            except Exception:
+                pass
+
+            browser.close()
+    except Exception as exc:
+        cart_url = "https://blinkit.com/cart" if retailer == "blinkit" else "https://www.zepto.com/cart"
+        return {
+            "status": "partial",
+            "message": f"Browser interaction encountered: {exc}",
+            "added_count": len(added),
+            "cart_url": cart_url,
+        }
+
+    cart_url = "https://blinkit.com/cart" if retailer == "blinkit" else "https://www.zepto.com/cart"
+    return {
+        "status": "success",
+        "retailer": retailer,
+        "items_added": len(added),
+        "failed_items": failed,
+        "cart_url": cart_url,
+        "message": f"Successfully added {len(added)} item(s) to your {retailer.capitalize()} cart! Review items and proceed to checkout: {cart_url}",
     }
 
 

@@ -41,23 +41,14 @@ from .cloak_client import (
 )
 from .models import Product, RetailerResult
 
-# How long to let a bot challenge clear on its own before calling it a block. A
-# managed challenge that is going to pass usually does so within a few seconds.
-CHALLENGE_SETTLE_SECONDS = 4.0
-CHALLENGE_RETRY_SECONDS = 8.0
+# Tuned timeouts for fast response and responsive user experience
+CHALLENGE_SETTLE_SECONDS = 2.0
+CHALLENGE_RETRY_SECONDS = 3.0
+CHALLENGE_CLEAR_TIMEOUT = 12.0
+CHALLENGE_POLL_SECONDS = 2.0
 
-# A bot challenge does not only fire on landing. Observed on Blinkit: the landing page
-# passed cleanly, then a Cloudflare Turnstile challenge fired on the *search*
-# navigation, the search API never responded, and the query came back empty while the
-# site looked fine. So the challenge is re-checked between search attempts too, and
-# given real time to clear — a Turnstile interstitial that is going to pass usually
-# does so within a few seconds of the page settling.
-CHALLENGE_CLEAR_TIMEOUT = 45.0
-CHALLENGE_POLL_SECONDS = 3.0
-
-# Attempts per query before the DOM rung is used. Three rather than two because a
-# challenge that clears on the second wait leaves the third attempt a clean run at it.
-SEARCH_ATTEMPTS = 3
+# Attempts per query before the DOM rung is used.
+SEARCH_ATTEMPTS = 2
 
 
 def wait_for_challenge_to_clear(
@@ -217,9 +208,20 @@ def drive_page(
         # search almost always captures cleanly — and the JSON rung is the only rung
         # that yields product ids, and therefore product URLs. Falling back to the
         # grid after one failed capture would silently halve URL coverage.
+        from urllib.parse import quote
+
+        if "zepto" in retailer_url.lower():
+            target_search_url = f"https://www.zepto.com/search?query={quote(query)}"
+        elif "instamart" in retailer_url.lower():
+            target_search_url = f"https://www.swiggy.com/instamart/search?query={quote(query)}"
+        elif "jiomart" in retailer_url.lower():
+            target_search_url = f"https://www.jiomart.com/search/{quote(query)}"
+        else:
+            target_search_url = f"https://blinkit.com/s/?q={quote(query)}"
+
         products: list[Product] = []
         for attempt in range(1, SEARCH_ATTEMPTS + 1):
-            fresh = _search_and_collect(page, recorder, query, log)
+            fresh = _search_and_collect(page, recorder, query, log, search_url=target_search_url)
             log(f"{query!r}: {len(fresh)} JSON response(s) captured during this search")
 
             products = _extract_from_network(fresh, query)
@@ -244,11 +246,10 @@ def drive_page(
                 # route change, so the XHR fires. It also recovers a page left on
                 # chrome-error:// by a failed navigation, which `goto` cannot search from.
                 try:
-                    page.goto(retailer_url, wait_until="domcontentloaded", timeout=60_000)
-                    time.sleep(CHALLENGE_SETTLE_SECONDS)
+                    page.goto(retailer_url, wait_until="domcontentloaded", timeout=20_000)
+                    time.sleep(1.0)
                 except Exception as exc:  # noqa: BLE001 - a failed re-warm is not fatal
                     log(f"{query!r}: could not re-warm the page ({type(exc).__name__}); continuing")
-                time.sleep(3.0)
 
         if not products:
             # Both JSON attempts came up empty, so read the rendered grid instead.

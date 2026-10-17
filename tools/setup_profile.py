@@ -140,7 +140,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_connect(args: argparse.Namespace) -> int:
-    """Open a setup session and let the human log in through it."""
+    """Open a setup session and launch a visible browser on Mac to log in."""
     body: dict = {}
     if args.url:
         body["url"] = args.url
@@ -160,62 +160,83 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     print(
         "\n" + "=" * 74 + "\n"
-        "LOG IN THROUGH THIS BROWSER — I never see your password.\n"
+        "LOG IN THROUGH THE BROWSER WINDOW THAT OPENS ON YOUR MAC.\n"
         + "=" * 74 + "\n"
-        f"cdp_url    : {cdp_url}\n"
-        f"session_id : {session_id}\n\n"
-        "Do this in the window that opens:\n"
-        "  1. Go to https://blinkit.com/\n"
-        "  2. Set the delivery location to pincode 560001\n"
-        "  3. Let the page settle until products are visible\n"
-        "  4. Come back here and press Enter\n\n"
-        "If no window opens, attach your own Playwright client to the cdp_url above:\n"
-        "  from playwright.sync_api import sync_playwright\n"
-        "  with sync_playwright() as p:\n"
-        "      browser = p.chromium.connect_over_cdp(cdp_url)\n"
-        "      page = browser.contexts[0].pages[0]\n"
-        "      page.goto('https://blinkit.com/')\n"
-        "      input('log in, set 560001, then press Enter')\n"
-        "      # do NOT call browser.close() — it would close TinyFish's browser\n"
+        f"session_id : {session_id}\n"
+        f"profile_id : {args.profile_id}\n\n"
+        "1. A visible Chrome/Chromium window will open.\n"
+        "2. Log in with your phone & OTP if not already logged in.\n"
+        "3. Set your delivery location / pincode (e.g. 560001).\n"
+        "4. Come back to this terminal and press Enter.\n"
     )
 
-    if not args.no_browser:
-        _open_visible_browser(cdp_url)
+    from playwright.sync_api import sync_playwright
 
-    try:
-        input("\nPress Enter once you are logged in and 560001 is set... ")
-    except (EOFError, KeyboardInterrupt):
-        print("\n(no input — continuing)")
-
-    print(
-        f"\nNow save what the session holds:\n"
-        f"  python {Path(__file__).name} save --profile-id {args.profile_id} "
-        f"--session-id {session_id}\n"
-    )
-    return 0
-
-
-def _open_visible_browser(cdp_url: str) -> None:
-    """Attach a visible local browser to the setup session, if Playwright is present."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("(Playwright is not installed locally; use the cdp_url manually.)")
-        return
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(cdp_url)
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+    with sync_playwright() as p:
+        local_browser = None
+        local_context = None
+        if not args.no_browser:
             try:
-                page.goto("https://blinkit.com/", wait_until="domcontentloaded", timeout=60_000)
-            except Exception as exc:  # noqa: BLE001
-                print(f"(could not pre-navigate: {type(exc).__name__}: {exc})")
-            print("A browser window is open on the TinyFish session. Log in there.")
-            # Deliberately no browser.close(): this is a CDP connection to TinyFish's
-            # browser, and closing it would tear down the very session we are warming.
-    except Exception as exc:  # noqa: BLE001
-        print(f"(could not open a local browser: {type(exc).__name__}: {exc})")
+                # Launch real visible browser on user's Mac
+                local_browser = p.chromium.launch(headless=False)
+                local_context = local_browser.new_context()
+                page = local_context.new_page()
+                target_url = args.url or "https://blinkit.com/"
+                print(f"Opening visible browser to {target_url}...")
+                page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+                print("Visible window is open on your screen! Please log in & set delivery location.")
+            except Exception as exc:
+                print(f"(Could not open local visible browser: {exc})")
+
+        try:
+            input("\nPress Enter once you are logged in and delivery pincode is set in the browser... ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n(continuing)")
+
+        # Extract storage state (cookies + localStorage)
+        state: dict[str, Any] = {}
+        if local_context:
+            try:
+                state = local_context.storage_state()
+                state_file = Path.cwd() / ".blinkit_storage_state.json"
+                state_file.write_text(json.dumps(state, indent=2))
+                print(f"\n[OK] Saved local session state to {state_file.name}")
+            except Exception as exc:
+                print(f"(warning: could not save local storage state: {exc})")
+
+        # Sync state into the remote TinyFish session over CDP
+        if cdp_url:
+            try:
+                print(f"Syncing session cookies to TinyFish session ({session_id})...")
+                remote_browser = p.chromium.connect_over_cdp(cdp_url)
+                remote_context = remote_browser.contexts[0] if remote_browser.contexts else remote_browser.new_context()
+                if state.get("cookies"):
+                    remote_context.add_cookies(state["cookies"])
+                remote_page = remote_context.pages[0] if remote_context.pages else remote_context.new_page()
+                try:
+                    remote_page.goto("https://blinkit.com/", wait_until="domcontentloaded", timeout=30_000)
+                except Exception:
+                    pass
+                print("[OK] Session successfully synced to TinyFish browser!")
+            except Exception as exc:
+                print(f"(note: CDP sync into TinyFish session encountered: {exc})")
+
+        if local_browser:
+            try:
+                local_browser.close()
+            except Exception:
+                pass
+
+    # Automatically persist session into TinyFish profile
+    print(f"\nPersisting session into TinyFish profile {args.profile_id}...")
+    save_payload = _request(
+        "POST",
+        f"/v1/profiles/{args.profile_id}/save",
+        json={"session_id": session_id},
+    )
+    print(json.dumps(save_payload, indent=2))
+    print(f"\n🎉 Profile {args.profile_id} is now warmed, saved, and ready for use!")
+    return 0
 
 
 def cmd_save(args: argparse.Namespace) -> int:
