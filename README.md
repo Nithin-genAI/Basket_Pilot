@@ -14,6 +14,22 @@ second retailer adapter.
 python -m basketpilot "milk, bread, eggs" --retailer blinkit --pincode 560001 --engine auto
 ```
 
+**Read this before you run it.** `auto` gives Engine A a fair shot first, and Engine A
+currently hangs on these retailers — so the command above spends up to `--max-duration`
+seconds (480 by default) waiting on TinyFish before escalating to the local browser that
+actually returns data. That is the architecturally correct order and the brief's mandated
+one, but it is slow, and the wait is dead time rather than work.
+
+For the same data in about three minutes, skip straight to the engine that works:
+
+```bash
+python -m basketpilot "milk, bread, eggs" --retailer blinkit --pincode 560001 --engine cloak
+```
+
+Both are real runs against live Blinkit. The `auto` path additionally records the Engine A
+failure inside the run log under `primary_engine_failure`, so nothing is hidden by taking
+the fast path.
+
 ## Setup
 
 ```bash
@@ -81,10 +97,21 @@ one-shot nested retries, which is what allowed a 403 to escape an earlier versio
 |---|---|---|
 | Root URL | HTTP 403 + `cf-mitigated: challenge` to plain HTTP; a real stealth browser gets HTTP 200 | Challenge detection reads the `cf-mitigated` header, the URL and the HTML — a challenge page is full HTML and a naive parser reads it as "no products" |
 | Location modal | **Auto-opens on landing.** Its overlay swallows clicks, so clicking "Select Location" always times out | We never click it: we wait for the modal's own input (`input[placeholder='search delivery location']`) and type into that |
-| Location persists | On a later run the modal **never appears** | The location step treats "no modal" as success, not failure. Waiting for a modal that will not come is a guaranteed 30s timeout |
+| Location persists | On a later run the modal **never appears** | The location step treats "no modal" as success, not failure. Waiting for a modal that will not come is a guaranteed timeout — the probe uses a short 8s window for exactly this reason |
 | Home page search bar | Is a div that opens an overlay — the home page has **no search `<input>` at all** | We navigate to the search route (`/s/?q=<query>`) instead of driving the box |
 | Product cards | Are divs with click handlers — there are **no `<a href>` product links** | Extraction reads Blinkit's own JSON, not anchors |
+| Product ids in the DOM | There are **none** — no `data-product-id`, no `data-prid`, no `/prid/` anywhere in the rendered grid (verified: `tools/probe_dom_id.py`) | The DOM rung therefore cannot produce a `product_url`. Those rows say so explicitly instead of leaving the field silently null |
 | Search API | `POST /v1/layout/search?q=<query>` returns `{is_success, response: {snippets: [...]}}`; products are `widget_type == "product_card_snippet_type_2"` | Read passively off the wire; we do **not** replay the call, so the rotating `auth_key`/`session_uuid` headers are never our problem |
+| Search XHR body | Is **sometimes lost to a race** — Blinkit's SPA navigates again immediately after the response, and a body not read before that navigation is gone: *"Response body is not available for a response that was navigated away from"* | The JSON rung is attempted **twice** before the DOM rung is used, because JSON is the only rung that yields product URLs. One unlucky capture is not evidence the API is down |
+| Product URL shape | `/prn/<slug>/prid/<id>`; the slug is cosmetic, the id is the key | Synthesised from the id + name, then **verified against the live site**: 3/3 constructed URLs returned HTTP 200 with the product name and an ADD button (`tools/probe_url.py`) |
+
+**Playwright (Engine B)**
+
+| Behaviour | Effect | How it is handled |
+|---|---|---|
+| Response bodies | Are readable only until the page navigates again: *"Response body is not available for a response that was navigated away from"* | The network recorder reads each body **inside** its response handler, the instant it arrives. A deferred read loses them — measured: deferring cost eggs its `product_url` on every row |
+| Event emitters | A response is emitted to the **context first, then the page**, as two sequential emits — not one nested pair | The recorder attaches to the **context**. Reading a body is a blocking Playwright call that re-enters the sync API, so a *page* handler runs it inside `page.emit(...)` — the same dispatch that drives `expect_response`'s waiter. The waiter then tears itself down mid-iteration and pyee's naked `list.pop` raises `KeyError: <function Waiter.reject_on_event.<locals>.listener ...>`. Moving to the context keeps the read out of that dispatch while still seeing every response |
+| `time.sleep` vs `wait_for_timeout` | Sync-API response events are dispatched **only while the main thread is inside a Playwright call**, so a `sleep`-and-poll loop never pumps the loop and every capture looks missing | Waiting is done with `page.expect_response(...)`, which both pumps the event loop and waits for the specific response |
 
 `--engine auto` (the default) runs TinyFish first and escalates to the local browser
 only when the failure is one another engine could plausibly survive. It never escalates
@@ -104,28 +131,34 @@ run log to `runs/<timestamp>-<retailer>-<engine>.json` containing the request pa
 (key redacted), terminal status, error code, step count, the raw engine response and the
 normalised result. On failure the log is where you diagnose from.
 
+One product, verbatim from a real run (the `warnings` array, which carries the product id,
+stock count and source URL, is elided here for width):
+
 ```json
 {
   "retailer": "Blinkit",
-  "engine": "tinyfish",
+  "engine": "cloak",
   "status": "COMPLETED",
   "products": [
     {
       "query": "milk",
       "name": "Amul Taaza Toned Milk",
+      "availability": "in_stock",
       "brand": "Amul",
       "package_size": "500 ml",
-      "price_displayed": "₹28",
-      "price_numeric": 28.0,
-      "availability": "in_stock",
-      "product_url": "https://blinkit.com/prid/...",
-      "evidence": "Amul Taaza Toned Milk 500 ml ₹28",
-      "source": "tinyfish",
-      "warnings": []
+      "price_displayed": "₹30",
+      "price_numeric": 30.0,
+      "currency": "INR",
+      "product_url": "https://blinkit.com/prn/amul-taaza-toned-milk/prid/19512",
+      "evidence": "Amul Taaza Toned Milk | Amul | 500 ml | ₹30",
+      "source": "cloak_json"
     }
   ]
 }
 ```
+
+`availability` is derived from Blinkit's own integer `inventory` count, not inferred from
+the presence of a button: `> 0` is `in_stock`, `0` is `out_of_stock`.
 
 ### Exit codes
 
@@ -146,33 +179,63 @@ code, not just requested in the prompt:
    currency-marked price in `price_displayed`, `price_numeric` is discarded and a
    warning is recorded.
 3. **Evidence must corroborate the price.** The schema requires an `evidence` field —
-   verbatim on-screen text the agent read the price from. If the digits of the price do
-   not appear in that evidence, the price is dropped. This turns "never invent a price"
-   from a promise into a check.
-4. **`minItems: 0` in the schema.** Setting a minimum above zero would pressure the
+   verbatim on-screen text the price was read from. If the digits of the price do not
+   appear in that evidence, the price is dropped. This turns "never invent a price" from
+   a promise into a check. For the **TinyFish** rung this is a genuine independent check,
+   because the agent supplies `evidence` separately from the price. For the **JSON** rung
+   the extractor builds `evidence` from the same card it read the price from, so it cannot
+   catch a misread on its own — the independent check there is the payload price
+   comparison below.
+4. **The displayed price is cross-checked against the payload's own price.** Blinkit
+   attaches a numeric price to each card's add-to-cart action. If that disagrees with the
+   displayed string, the mismatch is recorded as a warning and the *displayed* value is
+   kept — the string a human reads on the card is the one that has to be right.
+5. **`minItems: 0` in the schema.** Setting a minimum above zero would pressure the
    agent to invent a product to satisfy validation. Empty is explicitly allowed, and an
    empty result is treated as a failure.
-5. **A name alone is not a result.** A row with no price and no explicit out-of-stock
+6. **A name alone is not a result.** A row with no price and no explicit out-of-stock
    marker usually means a skeleton page, not a search result, so it does not count
    toward coverage.
-6. **`COMPLETED` is not success.** TinyFish reports `COMPLETED` when the *infrastructure*
+7. **`COMPLETED` is not success.** TinyFish reports `COMPLETED` when the *infrastructure*
    worked, which is not the same as the goal succeeding. A completed run with no usable
    products is a failure and triggers the fallback.
 
 Every product carries `source` (`tinyfish` | `cloak_json` | `cloak_dom`) and its
 extraction warnings, so each figure can be traced to where it came from.
 
+The gate is exercised by `python tools/verify.py`, which covers the cases that matter — a
+fabricated numeric with no readable price behind it, a numeric derived from the display,
+evidence that does not corroborate, evidence that does, `"500 ml"` not being read as a
+price, `"₹1,299"` parsing to `1299.0`, provenance warnings surviving validation, and a
+name-only row not counting as usable.
+
 ## Diagnostics
 
 ```bash
+python tools/verify.py                                 # all invariants, offline, no key
+python tools/selftest_tinyfish.py                      # is Engine A working at all?
 python -m basketpilot "milk" --engine cloak --headed   # watch the browser work
 python tools/smoke_cloak.py                            # is the site blocking us at all?
+python tools/probe_url.py                              # do constructed product URLs resolve?
+python tools/probe_dom_id.py                           # does the DOM expose product ids?
+python tools/diagnose_tinyfish_retailer.py --url https://www.jiomart.com/ --label JioMart
 ```
+
+`tools/verify.py` needs no network and no API key. It runs 29 checks over the invariants
+this project claims — the anti-fabrication gate, what counts as a usable result, query
+attribution, the unconfirmed-location rule, fallback diagnostics, dedupe, and which
+emitter the network recorder listens on — and exits non-zero if any of them regresses. It
+is the fast check to run after touching extraction or validation.
 
 `tools/smoke_cloak.py` is standalone: it launches the stealth browser, navigates to
 Blinkit, reports the HTTP status, the `cf-mitigated` header and the page title, writes a
 screenshot to `runs/`, and tells you plainly whether the challenge was cleared. Run it
 first whenever something is not working.
+
+`tools/diagnose_tinyfish_retailer.py` is a **diagnostic, not a retailer adapter** — it
+points Engine A at an arbitrary retailer to separate "TinyFish cannot do Indian retail"
+from "this one retailer is too hard". It adds no retailer to the product and its output is
+not part of the CLI's normal path.
 
 For Engine A, the run log carries `request_id` (TinyFish asks for it in support requests)
 and the raw error body with its `code` and `category`.
@@ -184,14 +247,200 @@ and the raw error body with its `code` and `category`.
   prevent them appearing. If both engines fail, the tool says so and exits non-zero. It
   does not fake a pass.
 - **Blinkit is a React SPA with generated CSS class names**, so the DOM-extraction rung is
-  brittle by design. That is why the captured-JSON rung is tried first.
-- **The location gate must be cleared** before any catalogue is visible. If the agent
-  reports `location_set: false`, the result is treated as failed rather than reported as
-  "no products found".
+  brittle by design. That is why the captured-JSON rung is tried first, and twice.
+- **Rows from the DOM rung carry no `product_url`.** This is structural, not a bug: the
+  search page exposes no product ids in any attribute or href (`tools/probe_dom_id.py`
+  found none). Before the JSON rung was retried, this showed up as a run with URLs on only
+  24 of 48 rows; after the retry it does not appear at all in a healthy run, because the
+  JSON rung is now given a second chance instead of being abandoned. The rung still exists
+  as a last resort, and when it is used every affected row says in its warnings why the URL
+  is missing.
+- **The location gate must be cleared** before any catalogue is visible. Both engines
+  treat an unconfirmed location as a failure, not a warning. This matters more than it
+  sounds: Blinkit's search API answers happily for an unserved pincode and returns a dozen
+  real products — for some *other* location. Prices that are real but attached to the wrong
+  place are exactly the silent substitution this project is not allowed to make, so a run
+  whose location step failed returns `LOCATION_NOT_SET`, exits non-zero, and marks every
+  row `location unverified` while keeping them for inspection.
+- **The `out_of_stock` branch is unexercised against live data.** `availability` is derived
+  from Blinkit's own integer `inventory` field, which is sound, but every row returned in
+  testing had stock, so the `inventory == 0` path has only been tested synthetically.
 - **CloakBrowser's free tier allows one concurrent session.** Do not run two `--engine
   cloak` invocations at once.
 - **Zepto is configured but untested.** `--retailer zepto` exists so the documented
   fallback is one flag away, not a rewrite. Phase 1 deliberately proves one retailer.
+
+## What happened with Engine A (TinyFish) — the honest result
+
+Engine A is the mandated Phase 1 integration, and it **works**. The same key, the same
+client and the same schema complete a real browser task against a neutral site — verified
+repeatedly, most recently run `9b3947d0-82ff-4666-97eb-78beae9eeb02`:
+`COMPLETED`, `num_of_steps: 2`, products with real prices returned
+(`python tools/selftest_tinyfish.py`).
+
+Against the Phase 1 target retailers it did not return data on any attempt:
+
+| Target | TinyFish outcome |
+|---|---|
+| Blinkit, run 1 | Stayed `RUNNING` for ~22 minutes with `num_of_steps: None`, then cancelled (`POST /v1/runs/{id}/cancel` → HTTP 200 → `CANCELLED`) |
+| Blinkit, run 2 | Stayed `RUNNING`, never terminal, `num_of_steps: None` |
+| JioMart — the control (`tools/diagnose_tinyfish_retailer.py`) | Stayed `RUNNING` past a 420s deadline, `num_of_steps: None`, ended `TIMEOUT` |
+| Blinkit, run 3 (inside `--engine auto`) | **`COMPLETED`** in ~2 minutes — and reported `location_set: false`, i.e. it reached the site but could not clear the delivery-location gate. Surfaced as `LOCATION_NOT_SET`, which triggered the fallback |
+| Blinkit, run 4 | **`COMPLETED`** in 19 steps — and named the cause itself (below) |
+
+So there are two distinct behaviours, and the honest summary is that Engine A is
+**intermittent** rather than uniformly broken:
+
+1. **Most runs hang.** Accepted, never steps, never terminal. `num_of_steps: None`
+   throughout is the telling detail — the agent never got as far as taking a step, which
+   points at reachability or scheduling for this class of site rather than at the agent
+   struggling with a hard page.
+2. **Sometimes it runs, reaches Blinkit, and gets blocked or cannot clear the location
+   gate.** Runs 3 and 4 did exactly that and said so themselves.
+
+Run 4 is the clearest evidence, because the agent diagnosed its own failure:
+
+> *"Blinkit returned an 'access denied / sorry, you have been blocked' page. A browser
+> reconfiguration with a US proxy was attempted but the block persisted. No location could
+> be set to pincode 560001 and no product search could be performed. Task cannot be
+> completed due to this blocking page."*
+
+That is Cloudflare, from TinyFish's own browser, in the agent's own words — and it is the
+mechanism the whole two-engine design was built around. Note the US proxy: `country_code:
+"IN"` is not in TinyFish's documented enum and returns **HTTP 400** (observed on this run
+too), so with the proxy dropped the egress is a datacentre IP from a supported region,
+which is the profile Cloudflare challenges hardest. Engine B clears the same challenge
+because it runs from a residential Indian IP.
+
+The location-gate failure in run 3 matches what we found independently: Blinkit's location
+modal auto-opens and its overlay swallows clicks, which is why Engine B has to type into
+the modal's own input rather than click anything.
+
+The JioMart run is what makes the hangs diagnosable rather than a guess. JioMart answers
+plain HTTP 200 and sits behind no Cloudflare challenge, so if Blinkit's Cloudflare were the
+cause, JioMart should have sailed through. It did not.
+
+And the selftest passed *after* both hangs — same key, same client, same session. So this is
+**not** a platform outage, **not** a bad key and **not** a broken integration: the plumbing
+works, and the failures are specific to these Indian retail targets. Distinguishing
+"cannot reach" from "never scheduled" needs TinyFish-side visibility we do not have, so we
+do not claim which it is.
+
+What we do claim, because it is what was observed: **Engine A cannot be relied on for these
+retailers today, and Engine B produced every product in this repository.**
+
+This is reported, not worked around. A poll past its deadline returns `status: TIMEOUT` with
+`_last_observed_status` and a message saying the run may still be going server-side, rather
+than hanging forever or reporting a silent empty success. The hangs cost 480s and 420s of
+wall clock, which is why `--engine cloak` is the fast path. And when `auto` does fall back,
+the primary engine's own diagnostics — its step count, its warnings and the agent's
+structured output, including the note explaining the failure — are carried into the merged
+run log rather than reduced to an error code.
+
+## Platforms tested
+
+Phase 1 proves **one** retailer end to end rather than seven shallowly. All seven target
+platforms were probed with a plain HTTP request first, to rank the risk honestly before
+committing to one:
+
+| Platform | Plain HTTP to root | Verdict |
+|---|---|---|
+| **Blinkit** | **403**, `cf-mitigated: challenge` | **Chosen and proven.** Hardest target, so proving it proves the approach. Products returned. |
+| Zepto | 202 via CloudFront | Configured as the documented fallback; not built in Phase 1 |
+| Swiggy Instamart | 202 via CloudFront | Not attempted in Phase 1 |
+| BigBasket | 403 | Not attempted in Phase 1 |
+| JioMart | 200 | **Probed with Engine A as a control** — it hung too, while a neutral site completed in the same session, which is how we know the TinyFish failure is specific to these targets. No adapter built. |
+| Amazon Fresh | 200 | Not attempted in Phase 1 |
+| Flipkart Grocery | 404 | Not attempted in Phase 1 |
+
+Exactly one retailer was actually integrated, as the brief required. Blinkit was tested with
+**both** engines; JioMart was tested with Engine A only, as a diagnostic control, and no
+adapter was written for it.
+
+A 403 to plain HTTP is not the same as a block to a real browser — Blinkit returns 403 to
+`curl` and HTTP 200 to the stealth browser. That distinction is the whole reason the
+CloakBrowser engine exists, and it is why the ranking above is a starting point rather
+than a conclusion.
+
+**Authentication: none was required.** Blinkit's catalogue is browsable without an
+account — it gates on *delivery location*, not on login. No TinyFish Browser Context
+Profile or Vault credential was needed, and none is configured. Login persistence is
+therefore **not claimed** — it was never exercised, and it is untested. A profile would
+only become relevant if a later phase needs cart or order access.
+
+## Status: what works and what failed
+
+**Works**
+
+- One real integration, against live Blinkit, returning validated structured data. A run
+  against `milk, bread, eggs` at pincode 560001 returned **60 products**, every one of them
+  with a name, brand, package size, displayed price, numeric price and product URL — the
+  complete field list the brief asked for, at 100% coverage, verified programmatically
+  rather than by eye.
+- Prices and pack sizes are real, read off Blinkit's own search response, and traceable:
+  every row carries the product id, the stock count and the source URL it came from, and
+  60/60 traced back to a captured search response.
+- Product URLs resolve — verified against the live site, 3/3 constructed URLs returned
+  HTTP 200 showing the right product.
+- Query attribution is clean: no cross-query leakage between milk, bread and eggs.
+- The anti-fabrication gate holds under nine adversarial checks, including a fabricated
+  numeric being dropped and `"500 ml"` not being read as a price.
+- Failure paths are honest: a missing key exits 2 with an actionable message; a hung
+  TinyFish run becomes an explicit `TIMEOUT` with the last observed status; an unserved
+  pincode returns `LOCATION_NOT_SET` and exits non-zero instead of passing off another
+  location's prices as an answer; an empty search is screenshotted and warned about rather
+  than reported as success.
+- `--json-only` is genuinely pipe-clean. stdout carries the JSON payload and nothing else:
+  the CLI banner and both engines' progress logs go to stderr, so
+  `python -m basketpilot ... --json-only | jq` works.
+
+**Failed**
+
+- **Engine A (TinyFish) cannot be relied on for Blinkit or JioMart.** Most runs stay
+  `RUNNING` indefinitely with `num_of_steps: None` and never reach a terminal state. When
+  it does run, Blinkit serves it Cloudflare's block page — the agent said so itself:
+  *"Blinkit returned an 'access denied / sorry, you have been blocked' page... a browser
+  reconfiguration with a US proxy was attempted but the block persisted."* Meanwhile the
+  same client completes a real task against a neutral site in the same session, so the
+  plumbing is fine and the failure is target-specific. See *What happened with Engine A*
+  above. This is the most important negative result in Phase 1, because Engine A was the
+  mandated integration.
+- **Blinkit's search XHR body is intermittently lost** to a race with the SPA's own
+  navigation. Handled by retrying the JSON rung once — which is what took URL coverage from
+  50% to 100% — but the underlying race is a site behaviour we work around rather than fix.
+- **The DOM fallback rung cannot produce product URLs**, because Blinkit's search page
+  exposes no product ids anywhere. Structural, verified, and now recorded per-row.
+- **No authentication was needed, and no profile was tested.** Blinkit gates on delivery
+  location, not login, so TinyFish Browser Context Profiles and Vault were not exercised.
+  Login persistence is therefore **not claimed** — it is untested.
+- **Six of the seven target platforms were not integrated.** One was proven, as the brief
+  required; the other six are documented as untested rather than implied to work.
+
+## Next smallest step toward TrueForge
+
+The seam already exists. `basketpilot.normalize.search()` returns one `RetailerResult`
+regardless of which engine produced the data, so TrueForge has a single callable to target
+rather than two code paths.
+
+The smallest next step is to freeze that into a public entry point and **confront where the
+browser runs** — which is the real blocker, not the plumbing:
+
+```python
+# basketpilot/api.py — the one seam TrueForge calls
+def compare(queries: list[str], pincode: str) -> list[RetailerResult]: ...
+```
+
+Adding Zepto then becomes a config entry rather than a rewrite, which is the point.
+
+But there is a dependency worth naming before anyone wires this up. Engine A does not work
+for these retailers, so the working path is Engine B, and Engine B is a **local stealth
+Chromium on a residential Indian IP** — which is precisely why it clears Cloudflare where a
+datacentre IP does not. A TrueForge integration that runs server-side would move that
+browser to a datacentre, and the most likely outcome is that Blinkit starts returning 403 to
+it. So the next step is not "expose a function"; it is **decide where the browser lives** —
+a local sidecar TrueForge calls over HTTP, or a residential-proxy egress — and only then
+expose the seam. Wiring `compare()` into a server first would produce an integration that
+passes its unit tests and returns nothing in production.
 
 ## Terms of service
 
@@ -209,6 +458,12 @@ basketpilot/
 ├── cloak_client.py     # Engine B — local stealth browser
 ├── normalize.py        # retailer registry, engine orchestration, fallback
 └── cli.py              # argparse, run logging, exit codes
-tools/smoke_cloak.py    # standalone "is the site blocking us?" probe
+tools/
+├── verify.py                      # offline invariant suite — run this after changes
+├── selftest_tinyfish.py           # is Engine A working at all?
+├── smoke_cloak.py                 # is the site blocking us at all?
+├── probe_url.py                   # do constructed product URLs resolve?
+├── probe_dom_id.py                # does the DOM expose product ids?
+└── diagnose_tinyfish_retailer.py  # Engine A against any retailer (diagnostic only)
 runs/                   # timestamped run logs (gitignored)
 ```

@@ -1,0 +1,18 @@
+# Secrets — never commit
+.env
+
+# Run logs and diagnostics
+runs/
+
+# CloakBrowser persistent profile (contains cookies / session state)
+.cloak-profile/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# macOS
+.DS_Store
